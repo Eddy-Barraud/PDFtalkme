@@ -1,0 +1,3 @@
+[submodule "Shared/SilicIA"]
+	path = Shared/SilicIA
+	url = https://github.com/Eddy-Barraud/SilicIA.git

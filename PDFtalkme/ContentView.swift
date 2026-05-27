@@ -2,912 +2,219 @@
 //  ContentView.swift
 //  PDFtalkme
 //
-//  Created by OpenCode on 18/04/2026.
-//
 
 import SwiftUI
+import SwiftData
 import UniformTypeIdentifiers
-import LaTeXSwiftUI
 import PDFKit
+#if os(macOS)
 import AppKit
+#endif
 
+/// Two-pane PDFtalkme window: PDF reader on the left, SilicIA chat on the right.
+/// A single PDF is the only RAG context the chat sees.
 struct ContentView: View {
-    @StateObject private var chatService = PDFChatService()
-    @StateObject private var openRouter = PDFOpenRouter.shared
-    @State private var settings = AppSettings.load()
-    @State private var documents: [PDFDocumentTab] = []
-    @State private var selectedTabID: UUID?
-    @State private var selectedSelectionText = ""
-    @State private var prioritizedSelectionText: String?
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.openWindow) private var openWindow
+    @Binding var sharedPDFs: [URL]
+
+    @StateObject private var chatService = ChatService()
+    @State private var sharedURLs: [String] = []
+    @State private var sharedImages: [URL] = []
+
+    /// PDF currently displayed in the left pane. Kept independent from
+    /// `sharedPDFs` because `ChatView` treats `sharedPDFs` as a transient
+    /// inbox (it consumes it then calls `removeAll`).
+    @State private var displayedPDFURL: URL?
+
     @State private var focusedCitationRequest: PDFCitationFocusRequest?
     @State private var findRequest: PDFFindRequest?
-    @State private var findQuery = ""
-    @State private var showFindBar = false
-    @State private var findMatchCount = 0
-    @State private var findMatchIndex = 0
-    @State private var showPDFSidebar = true
-    @State private var sidebarMode: PDFSidebarMode = .outline
-    @State private var outlineItems: [PDFOutlineItem] = []
-    @State private var pagePreviews: [PDFPagePreview] = []
-    @State private var pageCount = 0
     @State private var sidebarRefreshRequestID = UUID()
-    @State private var showImporter = false
-    @State private var composerInput = ""
-    @FocusState private var isComposerFocused: Bool
-    @FocusState private var isFindFieldFocused: Bool
-    @Environment(\.colorScheme) private var colorScheme
+    @State private var selectionText = ""
 
-    private var selectedPDFURL: URL? {
-        guard let selectedTabID,
-              let tab = documents.first(where: { $0.id == selectedTabID }) else {
-            return nil
-        }
-        return tab.url
-    }
+    /// Persisted PDF-pane width. Using a custom split (HStack + draggable
+    /// divider) instead of `HSplitView`, which re-balances proportionally
+    /// whenever a child's intrinsic size changes (sheet, settings, picker)
+    /// — that caused the pane widths to drift on every interaction.
+    @AppStorage("pdftalkme.pdfPaneWidth") private var pdfPaneWidth: Double = 760
+
+    private let minPaneWidth: CGFloat = 360
+    private let dividerHitWidth: CGFloat = 6
 
     var body: some View {
-        HSplitView {
-            pdfPane
-                .frame(minWidth: 720, idealWidth: 940)
+        GeometryReader { geo in
+            HStack(spacing: 0) {
+                pdfPane
+                    .frame(width: clampedPDFPaneWidth(for: geo.size.width))
 
-            chatPane
-                .frame(minWidth: 360, idealWidth: 460, maxWidth: 560)
+                splitter(totalWidth: geo.size.width)
+
+                chatPane
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .fileImporter(
-            isPresented: $showImporter,
-            allowedContentTypes: [.pdf],
-            allowsMultipleSelection: true,
-            onCompletion: handlePDFImport
-        )
-        .onChange(of: settings) {
-            settings.save()
-        }
-        .onChange(of: selectedTabID) {
-            activateSelectedTab()
-        }
-        .onChange(of: openRouter.signal) {
-            consumePendingOpenRequests()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .pdfTalkmeOpenFind)) { _ in
-            showFindBar = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                isFindFieldFocused = true
+        .frame(minWidth: 900, minHeight: 600)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    openWindow(id: "main")
+                } label: {
+                    Label("New Window", systemImage: "plus.square.on.square")
+                }
+                .help("Open a new PDFtalkme window with an empty PDF view and a new conversation")
             }
         }
-        .task {
-            consumePendingOpenRequests()
+        .onChange(of: sharedPDFs) { _, newValue in
+            if let first = newValue.first(where: { $0.pathExtension.lowercased() == "pdf" }) {
+                displayedPDFURL = first
+            }
         }
+    }
+
+    private func clampedPDFPaneWidth(for total: CGFloat) -> CGFloat {
+        let maxAllowed = max(minPaneWidth, total - minPaneWidth - dividerHitWidth)
+        return min(max(CGFloat(pdfPaneWidth), minPaneWidth), maxAllowed)
+    }
+
+    /// Vertical hairline with an enlarged hit region for dragging.
+    private func splitter(totalWidth: CGFloat) -> some View {
+        Rectangle()
+            .fill(Color.clear)
+            .frame(width: dividerHitWidth)
+            .overlay(
+                Rectangle()
+                    .fill(Color.secondary.opacity(0.25))
+                    .frame(width: 1)
+            )
+#if os(macOS)
+            .onHover { inside in
+                if inside {
+                    NSCursor.resizeLeftRight.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+#endif
+            .gesture(
+                DragGesture()
+                    .onChanged { value in
+                        let proposed = CGFloat(pdfPaneWidth) + value.translation.width
+                        let maxAllowed = max(minPaneWidth, totalWidth - minPaneWidth - dividerHitWidth)
+                        pdfPaneWidth = Double(min(max(proposed, minPaneWidth), maxAllowed))
+                    }
+            )
     }
 
     private var pdfPane: some View {
-        ZStack(alignment: .topTrailing) {
-            VStack(spacing: 0) {
-                HStack(spacing: 10) {
-                    HStack(spacing: 8) {
-                        Image("PDFtalkmeLogo")
-                            .resizable()
-                            .interpolation(.high)
-                            .frame(width: 19, height: 19)
-                            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-                        Text("PDFtalkme")
-                            .font(.headline)
-                            .lineLimit(1)
-                    }
-
-                    Spacer()
-
-                    Button {
-                        showImporter = true
-                    } label: {
-                        Label("Open PDF", systemImage: "doc.badge.plus")
-                    }
-                    .buttonStyle(.borderedProminent)
-
-                    Button {
-                        showFindBar = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                            isFindFieldFocused = true
-                        }
-                    } label: {
-                        Image(systemName: "magnifyingglass")
-                    }
-                    .buttonStyle(.bordered)
-                    .help(settings.language == .french ? "Rechercher" : "Search")
-
-                    Button {
-                        showPDFSidebar.toggle()
-                    } label: {
-                        Image(systemName: "sidebar.left")
-                    }
-                    .buttonStyle(.bordered)
-                    .help(settings.language == .french ? "Afficher la barre laterale" : "Toggle sidebar")
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 14)
-                .padding(.bottom, 10)
-
-                if showFindBar {
-                    findBar
-                        .padding(.horizontal, 12)
-                        .padding(.bottom, 8)
-                }
-
-                if !documents.isEmpty {
-                    tabStrip
-                        .padding(.horizontal, 12)
-                        .padding(.bottom, 8)
-                }
-
-                Divider()
-
-                HStack(spacing: 0) {
-                    if showPDFSidebar {
-                        documentSidebar
-                            .frame(width: 220)
-
-                        Divider()
-                    }
-
-                    PDFDocumentView(
-                        pdfURL: selectedPDFURL,
-                        focusedCitationRequest: focusedCitationRequest,
-                        sidebarRefreshRequestID: sidebarRefreshRequestID,
-                        findRequest: findRequest,
-                        onSelectionChanged: { text in
-                            selectedSelectionText = text
-                        },
-                        onDropPDFURLs: { urls in
-                            addDroppedPDFs(urls)
-                        },
-                        onSidebarDataUpdated: { outline, previews, count in
-                            outlineItems = outline
-                            pagePreviews = previews
-                            pageCount = count
-                        },
-                        onFindStatusUpdated: { count, current in
-                            findMatchCount = count
-                            findMatchIndex = current ?? 0
-                        }
-                    )
-                    .overlay {
-                        if selectedPDFURL == nil {
-                            ContentUnavailableView(
-                                "Open or drop a PDF",
-                                systemImage: "doc.richtext",
-                                description: Text("Use Open PDF or drag and drop a PDF here.")
-                            )
-                        }
-                    }
-                }
-            }
-
-            if shouldShowSelectionPopup {
-                selectionPopup
-                    .padding(.top, selectionPopupTopPadding)
-                    .padding(.trailing, 18)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-            }
-        }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .animation(.easeInOut(duration: 0.18), value: shouldShowSelectionPopup)
-    }
-
-    private var tabStrip: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(documents) { tab in
-                    HStack(spacing: 6) {
-                        Button {
-                            selectedTabID = tab.id
-                            selectedSelectionText = ""
-                            prioritizedSelectionText = nil
-                        } label: {
-                            Text(tab.title)
-                                .lineLimit(1)
-                        }
-                        .buttonStyle(.plain)
-
-                        Button {
-                            closeTab(id: tab.id)
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundColor(.secondary)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(
-                        selectedTabID == tab.id
-                        ? Color.accentColor.opacity(0.18)
-                        : Color(nsColor: .controlBackgroundColor)
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                }
+        Group {
+            if displayedPDFURL != nil {
+                PDFDocumentView(
+                    pdfURL: displayedPDFURL,
+                    focusedCitationRequest: focusedCitationRequest,
+                    sidebarRefreshRequestID: sidebarRefreshRequestID,
+                    findRequest: findRequest,
+                    onSelectionChanged: { selectionText = $0 },
+                    onDropPDFURLs: { urls in
+                        if let first = urls.first { loadPDF(first) }
+                    },
+                    onSidebarDataUpdated: { _, _, _ in },
+                    onFindStatusUpdated: { _, _ in }
+                )
+            } else {
+                PDFEmptyState(
+                    onPickPDF: { urls in
+                        if let first = urls.first { loadPDF(first) }
+                    },
+                    onChooseTapped: presentOpenPanel
+                )
             }
         }
     }
 
     private var chatPane: some View {
-        VStack(spacing: 12) {
-            chatHeader
-
-            if let message = chatService.errorMessage {
-                Text(message)
-                    .font(.caption)
-                    .foregroundColor(.red)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            messageList
-
-            if let prioritizedSelectionText,
-               !prioritizedSelectionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                prioritizedBadge(text: prioritizedSelectionText)
-            }
-
-            composer
-        }
-        .padding(14)
-        .background(Color(nsColor: .controlBackgroundColor))
+        ChatView(
+            sharedURLs: $sharedURLs,
+            sharedPDFs: $sharedPDFs,
+            sharedImages: $sharedImages,
+            chatService: chatService,
+            mode: .pdfTalkme
+        )
     }
 
-    private var chatHeader: some View {
-        VStack(spacing: 12) {
-            HStack {
-                HStack(spacing: 8) {
-                    Image("PDFtalkmeLogo")
-                        .resizable()
-                        .interpolation(.high)
-                        .frame(width: 20, height: 20)
-                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-                    Text("PDFtalkme")
-                        .font(.title3)
-                        .fontWeight(.semibold)
-                }
-
-                Spacer()
-
-                Button {
-                    chatService.clearInMemoryConversation()
-                } label: {
-                    Label("New Chat", systemImage: "arrow.clockwise")
-                }
-                .buttonStyle(.bordered)
-
-                Button {
-                    chatService.clearHistoryForActiveDocument()
-                } label: {
-                    Label("Clear History", systemImage: "trash")
-                }
-                .buttonStyle(.bordered)
-                .disabled(selectedPDFURL == nil)
-            }
-
-            HStack(spacing: 10) {
-                Picker("Language", selection: $settings.language) {
-                    ForEach(ModelLanguage.allCases, id: \.self) { language in
-                        Text(language.rawValue).tag(language)
-                    }
-                }
-                .pickerStyle(.segmented)
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Temp \(String(format: "%.2f", settings.temperature))")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    Slider(value: $settings.temperature, in: AppSettings.temperatureRange, step: 0.05)
-                }
-            }
-        }
+    private func loadPDF(_ url: URL) {
+        displayedPDFURL = url
+        sharedPDFs = [url]
     }
 
-    private var messageList: some View {
-        ScrollView {
-            LazyVStack(spacing: 10) {
-                if chatService.messages.isEmpty {
-                    Text("Ask questions about the active PDF tab. Starred selections are forced as rank-1 retrieval context.")
-                        .foregroundColor(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                ForEach(chatService.messages) { message in
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(message.role == .user ? "You" : "Assistant")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-
-                        renderedMessageContent(message)
-                            .textSelection(.enabled)
-
-                        if let citations = message.citations,
-                           !citations.isEmpty {
-                            Divider()
-                            citationList(citations)
-                        }
-                    }
-                    .padding(10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(
-                        message.role == .user
-                        ? Color.accentColor.opacity(0.15)
-                        : Color(nsColor: .textBackgroundColor)
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                }
-
-                if chatService.isResponding {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("Thinking...")
-                            .foregroundColor(.secondary)
-                        Spacer()
-                    }
-                }
-            }
+    private func presentOpenPanel() {
+#if os(macOS)
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [.pdf]
+        panel.prompt = "Open"
+        panel.message = "Choose a PDF to open in PDFtalkme."
+        if panel.runModal() == .OK, let url = panel.url {
+            loadPDF(url)
         }
-        .padding(8)
-        .background(Color(nsColor: .textBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+#endif
+    }
+}
+
+/// Empty-state pane shown before any PDF is loaded.
+private struct PDFEmptyState: View {
+    let onPickPDF: ([URL]) -> Void
+    let onChooseTapped: () -> Void
+    @State private var isTargeted = false
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "doc.richtext")
+                .font(.system(size: 64, weight: .light))
+                .foregroundStyle(.secondary)
+            Text("Drop a PDF here to start")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+            Button("Choose PDF…", action: onChooseTapped)
+                .buttonStyle(.borderedProminent)
+        }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    @ViewBuilder
-    private func renderedMessageContent(_ message: PDFChatMessage) -> some View {
-        if message.role == .assistant {
-            LaTeX(ModelOutputLaTeXSanitizer.sanitize(message.content))
-                .font(.body)
-                .foregroundColor(colorScheme == .dark ? .white : .black)
-        } else {
-            Text(message.content)
+        .contentShape(Rectangle())
+        .background(isTargeted ? Color.accentColor.opacity(0.08) : Color.clear)
+        .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
+            loadPDFURLs(from: providers, completion: onPickPDF)
+            return true
         }
     }
 
-    private var findBar: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-                .foregroundColor(.secondary)
-
-            TextField(
-                settings.language == .french ? "Rechercher dans le PDF" : "Search in PDF",
-                text: $findQuery
-            )
-            .textFieldStyle(.roundedBorder)
-            .focused($isFindFieldFocused)
-            .onSubmit {
-                runFind(next: true)
-            }
-
-            Button {
-                runFind(next: false)
-            } label: {
-                Image(systemName: "chevron.up")
-            }
-            .buttonStyle(.bordered)
-            .disabled(findQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-            Button {
-                runFind(next: true)
-            } label: {
-                Image(systemName: "chevron.down")
-            }
-            .buttonStyle(.bordered)
-            .disabled(findQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-            Button {
-                showFindBar = false
-                findQuery = ""
-                findRequest = nil
-                findMatchCount = 0
-                findMatchIndex = 0
-                isFindFieldFocused = false
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-            }
-            .buttonStyle(.plain)
-            .foregroundColor(.secondary)
-
-            Text(findStatusLabel)
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .frame(minWidth: 60, alignment: .trailing)
-        }
-        .padding(8)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-
-    private var documentSidebar: some View {
-        VStack(spacing: 0) {
-            Picker("Sidebar", selection: $sidebarMode) {
-                Text(settings.language == .french ? "Plan" : "Outline").tag(PDFSidebarMode.outline)
-                Text(settings.language == .french ? "Pages" : "Pages").tag(PDFSidebarMode.pages)
-            }
-            .pickerStyle(.segmented)
-            .padding(8)
-
-            Divider()
-
-            if sidebarMode == .outline {
-                outlineList
-            } else {
-                pagePreviewList
+    private func loadPDFURLs(
+        from providers: [NSItemProvider],
+        completion: @escaping ([URL]) -> Void
+    ) {
+        let group = DispatchGroup()
+        var results: [URL] = []
+        let lock = NSLock()
+        for provider in providers {
+            group.enter()
+            _ = provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { data, _ in
+                defer { group.leave() }
+                guard let data,
+                      let url = URL(dataRepresentation: data, relativeTo: nil),
+                      url.pathExtension.lowercased() == "pdf" else { return }
+                lock.lock()
+                results.append(url)
+                lock.unlock()
             }
         }
-        .background(Color(nsColor: .controlBackgroundColor))
-    }
-
-    private var outlineList: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 4) {
-                if outlineItems.isEmpty {
-                    Text(settings.language == .french ? "Aucun plan" : "No outline")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    ForEach(outlineItems) { item in
-                        Button {
-                            focusedCitationRequest = PDFCitationFocusRequest(
-                                citation: PDFCitation(
-                                    rank: item.page,
-                                    source: "outline",
-                                    page: item.page,
-                                    snippet: nil,
-                                    isPriority: false
-                                )
-                            )
-                        } label: {
-                            HStack(spacing: 8) {
-                                Text(item.title)
-                                    .lineLimit(1)
-                                Spacer(minLength: 8)
-                                Text("\(item.page)")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
-                            .padding(.leading, CGFloat(item.level) * 10)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-            .padding(8)
+        group.notify(queue: .main) {
+            if !results.isEmpty { completion(results) }
         }
     }
-
-    private var pagePreviewList: some View {
-        ScrollView {
-            LazyVStack(spacing: 8) {
-                if pagePreviews.isEmpty {
-                    Text(settings.language == .french ? "Aucune page" : "No pages")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    ForEach(pagePreviews) { preview in
-                        Button {
-                            focusedCitationRequest = PDFCitationFocusRequest(
-                                citation: PDFCitation(
-                                    rank: preview.page,
-                                    source: "page-preview",
-                                    page: preview.page,
-                                    snippet: nil,
-                                    isPriority: false
-                                )
-                            )
-                        } label: {
-                            VStack(spacing: 6) {
-                                Image(nsImage: preview.thumbnail)
-                                    .resizable()
-                                    .interpolation(.high)
-                                    .scaledToFit()
-                                    .frame(height: 150)
-                                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-
-                                Text("\(settings.language == .french ? "Page" : "Page") \(preview.page)")
-                                    .font(.caption)
-                                    .foregroundColor(.primary)
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(8)
-                            .background(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .fill(Color(nsColor: .textBackgroundColor))
-                            )
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-            .padding(8)
-        }
-    }
-
-    private var composer: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            TextField("Ask about this PDF", text: $composerInput, axis: .vertical)
-                .lineLimit(1...5)
-                .textFieldStyle(.roundedBorder)
-                .focused($isComposerFocused)
-                .onSubmit {
-                    submit()
-                }
-
-            Button("Send") {
-                submit()
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(
-                composerInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                chatService.isResponding
-            )
-        }
-    }
-
-    private func citationList(_ citations: [PDFCitation]) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(settings.language == .french ? "Pages suggerees" : "Suggested pages")
-                .font(.caption2)
-                .foregroundColor(.secondary)
-
-            ForEach(citations) { citation in
-                Button {
-                    focusedCitationRequest = PDFCitationFocusRequest(citation: citation)
-                } label: {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(citationLabel(citation))
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                            .foregroundColor(.black)
-
-                        if let snippet = citation.snippet,
-                           !snippet.isEmpty {
-                            Text(snippet)
-                                .font(.caption2)
-                                .foregroundColor(.black.opacity(0.82))
-                                .lineLimit(2)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(8)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(Color(red: 0.83, green: 0.76, blue: 0.98))
-                    )
-                }
-                .buttonStyle(.plain)
-            }
-        }
-    }
-
-    private func citationLabel(_ citation: PDFCitation) -> String {
-        let pagePrefix = settings.language == .french ? "page" : "page"
-        let priority = citation.isPriority ? (settings.language == .french ? " • Priorite" : " • Priority") : ""
-        if let page = citation.page {
-            return "#\(citation.rank) \(pagePrefix) \(page)\(priority)"
-        }
-        return "#\(citation.rank)\(priority)"
-    }
-
-    private var selectionPopup: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("Selected passage", systemImage: "star.fill")
-                .font(.subheadline)
-                .fontWeight(.semibold)
-
-            Text(selectionPreview(selectedSelectionText))
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .lineLimit(3)
-
-            Button {
-                prioritizedSelectionText = selectedSelectionText
-            } label: {
-                Label("Ask about this selection", systemImage: "sparkles")
-            }
-            .buttonStyle(.borderedProminent)
-        }
-        .padding(12)
-        .frame(width: 300, alignment: .leading)
-        .background(.regularMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .shadow(radius: 8)
-    }
-
-    private func prioritizedBadge(text: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: "star.circle.fill")
-                .foregroundColor(.yellow)
-
-            Text("Rank-1 context from selection")
-                .font(.caption)
-                .fontWeight(.semibold)
-
-            Text(selectionPreview(text))
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .lineLimit(1)
-
-            Spacer(minLength: 8)
-
-            Button {
-                prioritizedSelectionText = nil
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-            }
-            .buttonStyle(.plain)
-            .foregroundColor(.secondary)
-        }
-        .padding(8)
-        .background(Color.yellow.opacity(0.15))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-
-    private var shouldShowSelectionPopup: Bool {
-        !selectedSelectionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    private var selectionPopupTopPadding: CGFloat {
-        var offset: CGFloat = 66
-        if showFindBar {
-            offset += 46
-        }
-        if !documents.isEmpty {
-            offset += 38
-        }
-        return offset
-    }
-
-    private var findStatusLabel: String {
-        if findMatchCount == 0 {
-            return settings.language == .french ? "0 resultat" : "0 matches"
-        }
-        return "\(findMatchIndex)/\(findMatchCount)"
-    }
-
-    private func selectionPreview(_ text: String) -> String {
-        let compact = text.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if compact.count <= 160 {
-            return compact
-        }
-        let end = compact.index(compact.startIndex, offsetBy: 160)
-        return String(compact[..<end]) + "..."
-    }
-
-    private func submit() {
-        let trimmed = composerInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        composerInput = ""
-
-        Task {
-            await chatService.sendMessage(
-                trimmed,
-                pdfURL: selectedPDFURL,
-                prioritizedSelectionText: prioritizedSelectionText,
-                settings: settings
-            )
-        }
-    }
-
-    private func handlePDFImport(_ result: Result<[URL], Error>) {
-        guard case .success(let urls) = result else { return }
-        addPDFTabs(urls)
-    }
-
-    private func addDroppedPDFs(_ urls: [URL]) {
-        var persisted: [URL] = []
-        for url in urls where url.pathExtension.lowercased() == "pdf" {
-            if let stableURL = copyDroppedPDFToTemporaryStorage(url) {
-                persisted.append(stableURL)
-            }
-        }
-        if !persisted.isEmpty {
-            addPDFTabs(persisted)
-        }
-    }
-
-    private func addPDFTabs(_ urls: [URL], allowSelectingExistingTab: Bool = true) {
-        for url in urls where url.pathExtension.lowercased() == "pdf" {
-            if allowSelectingExistingTab,
-               let existing = documents.first(where: { $0.url.standardizedFileURL == url.standardizedFileURL }) {
-                selectedTabID = existing.id
-                continue
-            }
-            let tab = PDFDocumentTab(url: url)
-            documents.append(tab)
-            selectedTabID = tab.id
-        }
-
-        if selectedTabID == nil, let first = documents.first {
-            selectedTabID = first.id
-        }
-
-        selectedSelectionText = ""
-        prioritizedSelectionText = nil
-        activateSelectedTab()
-    }
-
-    private func copyDroppedPDFToTemporaryStorage(_ sourceURL: URL) -> URL? {
-        let fileManager = FileManager.default
-        let folder = fileManager.temporaryDirectory.appendingPathComponent("PDFtalkmeDroppedPDFs", isDirectory: true)
-
-        do {
-            try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
-            let preferredName = sourceURL.lastPathComponent.isEmpty ? "dropped.pdf" : sourceURL.lastPathComponent
-            let uniqueFolder = folder.appendingPathComponent(UUID().uuidString, isDirectory: true)
-            try fileManager.createDirectory(at: uniqueFolder, withIntermediateDirectories: true)
-            let destination = uniqueFolder.appendingPathComponent(preferredName)
-            if fileManager.fileExists(atPath: destination.path) {
-                try fileManager.removeItem(at: destination)
-            }
-            try fileManager.copyItem(at: sourceURL, to: destination)
-            return destination
-        } catch {
-            #if DEBUG
-            print("[ContentView] Failed to persist dropped PDF: \(error.localizedDescription)")
-            #endif
-            return nil
-        }
-    }
-
-    private func closeTab(id: UUID) {
-        guard let index = documents.firstIndex(where: { $0.id == id }) else { return }
-        documents.remove(at: index)
-
-        if selectedTabID == id {
-            selectedTabID = documents.indices.contains(index)
-                ? documents[index].id
-                : documents.last?.id
-            selectedSelectionText = ""
-            prioritizedSelectionText = nil
-            activateSelectedTab()
-        }
-    }
-
-    private func activateSelectedTab() {
-        selectedSelectionText = ""
-        prioritizedSelectionText = nil
-        focusedCitationRequest = nil
-        findRequest = nil
-        findMatchCount = 0
-        findMatchIndex = 0
-        outlineItems = []
-        pagePreviews = []
-        pageCount = 0
-        sidebarRefreshRequestID = UUID()
-        chatService.activateDocument(selectedPDFURL)
-    }
-
-    private func consumePendingOpenRequests() {
-        let requests = openRouter.drain()
-        guard !requests.isEmpty else { return }
-        for request in requests {
-            addPDFTabs(request.urls, allowSelectingExistingTab: !request.openInNewTabs)
-        }
-    }
-
-    private func runFind(next: Bool) {
-        let query = findQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return }
-        selectedSelectionText = ""
-        findRequest = PDFFindRequest(
-            query: query,
-            direction: next ? .next : .previous
-        )
-    }
-
-}
-
-private enum ModelOutputLaTeXSanitizer {
-    static func sanitize(_ input: String) -> String {
-        var sanitized = input
-        sanitized = replacingRegex(
-            in: sanitized,
-            pattern: #"(?<!\s)(\\[A-Za-z]+)"#,
-            with: " $1"
-        )
-        sanitized = replacingDigitPowers(in: sanitized)
-        return sanitized
-    }
-
-    private static func replacingDigitPowers(in text: String) -> String {
-        var output = text
-        output = replacingDigitPowerMatches(in: output, pattern: #"(?<!\\mathrm\{)(\d+)\^\{([^{}]+)\}"#)
-        output = replacingDigitPowerMatches(in: output, pattern: #"(?<!\\mathrm\{)(\d+)\^(-?\d+)"#)
-        return output
-    }
-
-    private static func replacingDigitPowerMatches(in text: String, pattern: String) -> String {
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
-        let nsText = text as NSString
-        let matches = regex.matches(in: text, range: NSRange(location: 0, length: nsText.length))
-        guard !matches.isEmpty else { return text }
-
-        var output = text
-        for match in matches.reversed() {
-            guard match.numberOfRanges >= 3,
-                  let wholeRange = Range(match.range(at: 0), in: output),
-                  let baseRange = Range(match.range(at: 1), in: output),
-                  let exponentRange = Range(match.range(at: 2), in: output) else {
-                continue
-            }
-
-            let base = String(output[baseRange])
-            let exponent = String(output[exponentRange])
-            output.replaceSubrange(wholeRange, with: "\\mathrm{\(base)}^\\mathrm{\(exponent)}")
-        }
-        return output
-    }
-
-    private static func replacingRegex(in text: String, pattern: String, with template: String) -> String {
-        text.replacingOccurrences(of: pattern, with: template, options: .regularExpression)
-    }
-}
-
-private struct PDFDocumentTab: Identifiable, Equatable {
-    let id: UUID
-    let url: URL
-    let title: String
-
-    init(id: UUID = UUID(), url: URL) {
-        self.id = id
-        self.url = url
-        let rawTitle = url.deletingPathExtension().lastPathComponent
-        self.title = rawTitle.replacingOccurrences(
-            of: #"-?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"#,
-            with: "",
-            options: .regularExpression
-        )
-    }
-}
-
-enum PDFSidebarMode {
-    case outline
-    case pages
-}
-
-struct PDFOutlineItem: Identifiable {
-    let id = UUID()
-    let title: String
-    let page: Int
-    let level: Int
-}
-
-struct PDFPagePreview: Identifiable {
-    let id = UUID()
-    let page: Int
-    let thumbnail: NSImage
-}
-
-enum PDFFindDirection {
-    case previous
-    case next
-}
-
-struct PDFFindRequest: Equatable {
-    let query: String
-    let direction: PDFFindDirection
-    let requestID: UUID
-
-    init(query: String, direction: PDFFindDirection, requestID: UUID = UUID()) {
-        self.query = query
-        self.direction = direction
-        self.requestID = requestID
-    }
-}
-
-extension Notification.Name {
-    static let pdfTalkmeOpenFind = Notification.Name("PDFtalkme.OpenFind")
 }
 
 #Preview {
-    ContentView()
+    ContentView(sharedPDFs: .constant([]))
         .frame(width: 1400, height: 900)
 }

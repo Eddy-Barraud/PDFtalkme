@@ -2,41 +2,54 @@
 //  PDFtalkmeApp.swift
 //  PDFtalkme
 //
-//  Created by OpenCode on 18/04/2026.
-//
 
 import SwiftUI
+import SwiftData
 #if os(macOS)
 import AppKit
 #endif
 
 @main
 struct PDFtalkmeApp: App {
-    @StateObject private var openRouter = PDFOpenRouter.shared
+    init() {
+        _ = LocalizationService.shared
+        if case .unavailable(let reason) = FoundationModelAvailability.check() {
+            _modelUnavailableMessage = State(initialValue: reason)
+        } else {
+            _modelUnavailableMessage = State(initialValue: nil)
+        }
+    }
+
+    @State private var sharedPDFs: [URL] = []
+    @State private var modelUnavailableMessage: String?
+
 #if os(macOS)
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 #endif
 
     var body: some Scene {
-        WindowGroup {
-            ContentView()
-                .onOpenURL(perform: handleIncomingURL)
+        WindowGroup(id: "main") {
+            if let message = modelUnavailableMessage {
+                ModelUnavailableView(message: message)
+            } else {
+                ContentView(sharedPDFs: $sharedPDFs)
+                    .onOpenURL(perform: handleIncomingURL)
 #if os(macOS)
-                .onAppear {
-                    appDelegate.onOpenURLs = { urls in
-                        openRouter.enqueue(urls, openInNewTabs: true)
+                    .onAppear {
+                        appDelegate.onOpenURLs = { urls in
+                            handleIncomingURLs(urls)
+                        }
+                        let pending = appDelegate.drainPendingURLs()
+                        if !pending.isEmpty {
+                            handleIncomingURLs(pending)
+                        }
                     }
-
-                    let pending = appDelegate.drainPendingURLs()
-                    if !pending.isEmpty {
-                        openRouter.enqueue(pending)
-                    }
-                }
 #endif
+            }
         }
         .defaultSize(width: 1460, height: 940)
-
-        #if os(macOS)
+        .modelContainer(for: [Conversation.self, Message.self])
+#if os(macOS)
         .commands {
             CommandMenu("Find") {
                 Button("Find in PDF") {
@@ -45,11 +58,17 @@ struct PDFtalkmeApp: App {
                 .keyboardShortcut("f", modifiers: .command)
             }
         }
-        #endif
+#endif
     }
 
     private func handleIncomingURL(_ url: URL) {
-        openRouter.enqueue([url], openInNewTabs: true)
+        handleIncomingURLs([url])
+    }
+
+    private func handleIncomingURLs(_ urls: [URL]) {
+        if let firstPDF = urls.first(where: { $0.pathExtension.lowercased() == "pdf" }) {
+            sharedPDFs = [firstPDF]
+        }
     }
 }
 
@@ -57,11 +76,6 @@ struct PDFtalkmeApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var onOpenURLs: (([URL]) -> Void)?
     private var pendingURLs: [URL] = []
-
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.servicesProvider = self
-        NSUpdateDynamicServices()
-    }
 
     func application(_ application: NSApplication, open urls: [URL]) {
         if let onOpenURLs {
@@ -81,42 +95,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    func application(_ sender: NSApplication, openFiles filenames: [String]) {
-        let urls = filenames.map { URL(fileURLWithPath: $0) }
-        if let onOpenURLs {
-            onOpenURLs(urls)
-        } else {
-            pendingURLs.append(contentsOf: urls)
-        }
-        sender.reply(toOpenOrPrint: .success)
-    }
-
     func drainPendingURLs() -> [URL] {
         defer { pendingURLs.removeAll() }
         return pendingURLs
     }
 
-    @objc func askPDF(_ pboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>?) {
-        let classes: [AnyClass] = [NSURL.self]
-        let options: [NSPasteboard.ReadingOptionKey: Any] = [
-            .urlReadingFileURLsOnly: true
-        ]
-        guard let urls = pboard.readObjects(forClasses: classes, options: options) as? [URL] else {
-            error?.pointee = "No files were provided." as NSString
-            return
-        }
-
-        let pdfURLs = urls.filter { $0.pathExtension.lowercased() == "pdf" }
-        guard !pdfURLs.isEmpty else {
-            error?.pointee = "Please select at least one PDF file." as NSString
-            return
-        }
-
-        if let onOpenURLs {
-            onOpenURLs(pdfURLs)
-        } else {
-            pendingURLs.append(contentsOf: pdfURLs)
-        }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return true
     }
 }
 #endif

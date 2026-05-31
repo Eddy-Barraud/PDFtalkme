@@ -2,912 +2,529 @@
 //  ContentView.swift
 //  PDFtalkme
 //
-//  Created by OpenCode on 18/04/2026.
-//
 
 import SwiftUI
+import SwiftData
+import Combine
 import UniformTypeIdentifiers
-import LaTeXSwiftUI
 import PDFKit
+#if os(macOS)
 import AppKit
+#endif
 
+/// Two-pane PDFtalkme window: PDF reader on the left (with a tab strip for
+/// multiple open PDFs), SilicIA chat on the right. All open tabs are fed
+/// to ChatService as RAG context; the chat is anchored to the first tab,
+/// which is what gets stored on the Conversation for reopen-by-filename.
 struct ContentView: View {
-    @StateObject private var chatService = PDFChatService()
-    @StateObject private var openRouter = PDFOpenRouter.shared
-    @State private var settings = AppSettings.load()
-    @State private var documents: [PDFDocumentTab] = []
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.openWindow) private var openWindow
+    @Binding var sharedPDFs: [URL]
+
+    @StateObject private var chatService = ChatService()
+    @State private var sharedURLs: [String] = []
+    @State private var sharedImages: [URL] = []
+
+    @State private var openTabs: [PDFTab] = []
     @State private var selectedTabID: UUID?
-    @State private var selectedSelectionText = ""
-    @State private var prioritizedSelectionText: String?
+
     @State private var focusedCitationRequest: PDFCitationFocusRequest?
     @State private var findRequest: PDFFindRequest?
-    @State private var findQuery = ""
-    @State private var showFindBar = false
-    @State private var findMatchCount = 0
-    @State private var findMatchIndex = 0
-    @State private var showPDFSidebar = true
-    @State private var sidebarMode: PDFSidebarMode = .outline
-    @State private var outlineItems: [PDFOutlineItem] = []
-    @State private var pagePreviews: [PDFPagePreview] = []
-    @State private var pageCount = 0
     @State private var sidebarRefreshRequestID = UUID()
-    @State private var showImporter = false
-    @State private var composerInput = ""
-    @FocusState private var isComposerFocused: Bool
-    @FocusState private var isFindFieldFocused: Bool
-    @Environment(\.colorScheme) private var colorScheme
+    @State private var selectionText = ""
+    @State private var checksumTask: Task<Void, Never>?
+    /// Publisher used to ask `ChatView` to drop a PDF context row when the
+    /// user closes the matching tab on the left. We hold the subject so it
+    /// outlives view updates; `ChatView` subscribes once via `.onReceive`.
+    @State private var pdfRemovalSubject = PassthroughSubject<URL, Never>()
 
-    private var selectedPDFURL: URL? {
-        guard let selectedTabID,
-              let tab = documents.first(where: { $0.id == selectedTabID }) else {
-            return nil
-        }
-        return tab.url
+    /// Drives the floating page / search controls and bridges to the live
+    /// PDFView. One per window.
+    @State private var previewController = PDFPreviewController()
+
+    /// PDF pane width as a fraction of the window's content width. Storing
+    /// a ratio (rather than an absolute width) means a window resize keeps
+    /// the two panes' relative proportions automatically.
+    @AppStorage("pdftalkme.pdfPaneFraction") private var pdfPaneFraction: Double = 0.62
+    /// Pane width captured at the start of a splitter drag, so the drag
+    /// tracks the cursor 1:1 instead of compounding `translation` against a
+    /// width we're mutating every frame.
+    @State private var dragStartPaneWidth: CGFloat?
+
+    private let minPaneWidth: CGFloat = 360
+    private let dividerHitWidth: CGFloat = 6
+
+    private var displayedPDFURL: URL? {
+        openTabs.first(where: { $0.id == selectedTabID })?.url
     }
 
     var body: some View {
-        HSplitView {
-            pdfPane
-                .frame(minWidth: 720, idealWidth: 940)
+        GeometryReader { geo in
+            HStack(spacing: 0) {
+                pdfPane
+                    .frame(width: pdfPaneWidth(for: geo.size.width))
 
-            chatPane
-                .frame(minWidth: 360, idealWidth: 460, maxWidth: 560)
+                splitter(totalWidth: geo.size.width)
+
+                chatPane
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .fileImporter(
-            isPresented: $showImporter,
-            allowedContentTypes: [.pdf],
-            allowsMultipleSelection: true,
-            onCompletion: handlePDFImport
-        )
-        .onChange(of: settings) {
-            settings.save()
-        }
-        .onChange(of: selectedTabID) {
-            activateSelectedTab()
-        }
-        .onChange(of: openRouter.signal) {
-            consumePendingOpenRequests()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .pdfTalkmeOpenFind)) { _ in
-            showFindBar = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                isFindFieldFocused = true
+        .frame(minWidth: 900, minHeight: 600)
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button {
+                    clearWindow()
+                } label: {
+                    Label("Clear", systemImage: "trash")
+                }
+                .help("Close all PDFs and start a new conversation")
+
+                Button {
+                    openWindow(id: "main")
+                } label: {
+                    Label("New Window", systemImage: "plus.square.on.square")
+                }
+                .help("Open a new PDFtalkme window with an empty PDF view and a new conversation")
             }
         }
-        .task {
-            consumePendingOpenRequests()
+        .onAppear {
+            previewController.onRequestPaneWidth = { desired in
+                applyPaneWidth(desired)
+            }
+        }
+        .onChange(of: sharedPDFs) { _, newValue in
+            for url in newValue where url.pathExtension.lowercased() == "pdf" {
+                addTab(for: url, makeActive: true)
+            }
+        }
+        // React to the chat service switching conversations. The filename
+        // is the source of truth — `currentConversationPDFBookmark` resolves
+        // to a URL whose path can differ byte-for-byte from the URL the tab
+        // was opened with (sandbox-container symlinks, security-scope
+        // normalization). If a tab with that filename is already open we do
+        // *nothing*: the tab was added on drop/pick before sendMessage ran,
+        // and re-pushing `sharedPDFs` here would make `ChatView.mergeShared`
+        // run a second time mid-streaming and risk a `resetConversation`.
+        // Mirror the full PDF set of the active conversation into tabs.
+        // When restoring a chat that had multiple documents in context,
+        // every one of them needs to come back. We never close existing
+        // tabs here — the user may have an unrelated PDF open they want
+        // to keep — and we never yank the current selection.
+        .onReceive(chatService.$currentConversationPDFFilenames.removeDuplicates()) { filenames in
+            guard !filenames.isEmpty else { return }
+            let bookmarks = chatService.currentConversationPDFBookmarks
+            var addedAny = false
+            for (index, name) in filenames.enumerated() {
+                let key = ChatService.pdfBaseFilename(name)
+                if openTabs.contains(where: {
+                    ChatService.pdfBaseFilename($0.url.lastPathComponent) == key
+                }) {
+                    continue
+                }
+                guard index < bookmarks.count,
+                      let url = resolveSecurityScopedBookmark(bookmarks[index]) else { continue }
+                // makeActive only on the very first restored tab when the
+                // window currently has no selection — otherwise leave the
+                // user's selection where it is.
+                let shouldActivate = !addedAny && selectedTabID == nil
+                addTab(for: url, makeActive: shouldActivate)
+                addedAny = true
+            }
         }
     }
 
+    // MARK: - Panes
+
     private var pdfPane: some View {
-        ZStack(alignment: .topTrailing) {
-            VStack(spacing: 0) {
-                HStack(spacing: 10) {
-                    HStack(spacing: 8) {
-                        Image("PDFtalkmeLogo")
-                            .resizable()
-                            .interpolation(.high)
-                            .frame(width: 19, height: 19)
-                            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-                        Text("PDFtalkme")
-                            .font(.headline)
-                            .lineLimit(1)
-                    }
-
-                    Spacer()
-
-                    Button {
-                        showImporter = true
-                    } label: {
-                        Label("Open PDF", systemImage: "doc.badge.plus")
-                    }
-                    .buttonStyle(.borderedProminent)
-
-                    Button {
-                        showFindBar = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                            isFindFieldFocused = true
-                        }
-                    } label: {
-                        Image(systemName: "magnifyingglass")
-                    }
-                    .buttonStyle(.bordered)
-                    .help(settings.language == .french ? "Rechercher" : "Search")
-
-                    Button {
-                        showPDFSidebar.toggle()
-                    } label: {
-                        Image(systemName: "sidebar.left")
-                    }
-                    .buttonStyle(.bordered)
-                    .help(settings.language == .french ? "Afficher la barre laterale" : "Toggle sidebar")
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 14)
-                .padding(.bottom, 10)
-
-                if showFindBar {
-                    findBar
-                        .padding(.horizontal, 12)
-                        .padding(.bottom, 8)
-                }
-
-                if !documents.isEmpty {
-                    tabStrip
-                        .padding(.horizontal, 12)
-                        .padding(.bottom, 8)
-                }
-
+        VStack(spacing: 0) {
+            if !openTabs.isEmpty {
+                tabStrip
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
                 Divider()
-
-                HStack(spacing: 0) {
-                    if showPDFSidebar {
-                        documentSidebar
-                            .frame(width: 220)
-
-                        Divider()
-                    }
-
-                    PDFDocumentView(
-                        pdfURL: selectedPDFURL,
-                        focusedCitationRequest: focusedCitationRequest,
-                        sidebarRefreshRequestID: sidebarRefreshRequestID,
-                        findRequest: findRequest,
-                        onSelectionChanged: { text in
-                            selectedSelectionText = text
-                        },
-                        onDropPDFURLs: { urls in
-                            addDroppedPDFs(urls)
-                        },
-                        onSidebarDataUpdated: { outline, previews, count in
-                            outlineItems = outline
-                            pagePreviews = previews
-                            pageCount = count
-                        },
-                        onFindStatusUpdated: { count, current in
-                            findMatchCount = count
-                            findMatchIndex = current ?? 0
-                        }
-                    )
-                    .overlay {
-                        if selectedPDFURL == nil {
-                            ContentUnavailableView(
-                                "Open or drop a PDF",
-                                systemImage: "doc.richtext",
-                                description: Text("Use Open PDF or drag and drop a PDF here.")
-                            )
-                        }
-                    }
-                }
             }
-
-            if shouldShowSelectionPopup {
-                selectionPopup
-                    .padding(.top, selectionPopupTopPadding)
-                    .padding(.trailing, 18)
-                    .transition(.move(edge: .top).combined(with: .opacity))
+            if let displayedPDFURL {
+                PDFDocumentView(
+                    pdfURL: displayedPDFURL,
+                    focusedCitationRequest: focusedCitationRequest,
+                    sidebarRefreshRequestID: sidebarRefreshRequestID,
+                    findRequest: findRequest,
+                    previewController: previewController,
+                    onSelectionChanged: { selectionText = $0 },
+                    onDropPDFURLs: { urls in
+                        for u in urls { loadPDF(u) }
+                    },
+                    onSidebarDataUpdated: { _, _, _ in },
+                    onFindStatusUpdated: { _, _ in }
+                )
+                .overlay(alignment: .bottom) {
+                    PDFFloatingControls(controller: previewController)
+                        .padding(.bottom, 14)
+                }
+                .overlay(alignment: .topTrailing) {
+                    PDFSearchBar(controller: previewController)
+                        .padding(.top, 12)
+                        .padding(.trailing, 14)
+                }
+            } else {
+                PDFEmptyState(
+                    onPickPDF: { urls in
+                        for u in urls { loadPDF(u) }
+                    },
+                    onChooseTapped: presentOpenPanel
+                )
             }
         }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .animation(.easeInOut(duration: 0.18), value: shouldShowSelectionPopup)
     }
 
     private var tabStrip: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(documents) { tab in
-                    HStack(spacing: 6) {
-                        Button {
-                            selectedTabID = tab.id
-                            selectedSelectionText = ""
-                            prioritizedSelectionText = nil
-                        } label: {
-                            Text(tab.title)
-                                .lineLimit(1)
-                        }
-                        .buttonStyle(.plain)
-
-                        Button {
-                            closeTab(id: tab.id)
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundColor(.secondary)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(
-                        selectedTabID == tab.id
-                        ? Color.accentColor.opacity(0.18)
-                        : Color(nsColor: .controlBackgroundColor)
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            HStack(spacing: 4) {
+                ForEach(openTabs) { tab in
+                    tabChip(tab)
                 }
+                Button {
+                    presentOpenPanel()
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 12, weight: .semibold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                }
+                .buttonStyle(.plain)
+                .help("Open another PDF in a new tab")
             }
+        }
+    }
+
+    private func tabChip(_ tab: PDFTab) -> some View {
+        let isSelected = tab.id == selectedTabID
+        return HStack(spacing: 6) {
+            Image(systemName: "doc.richtext")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            Text(tab.title)
+                .lineLimit(1)
+                .font(.system(size: 12))
+            Button {
+                closeTab(tab)
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .padding(2)
+            }
+            .buttonStyle(.plain)
+            .help("Close tab")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(isSelected ? Color.accentColor.opacity(0.15) : Color.secondary.opacity(0.08))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(isSelected ? Color.accentColor.opacity(0.4) : Color.clear, lineWidth: 1)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            selectedTabID = tab.id
         }
     }
 
     private var chatPane: some View {
-        VStack(spacing: 12) {
-            chatHeader
-
-            if let message = chatService.errorMessage {
-                Text(message)
-                    .font(.caption)
-                    .foregroundColor(.red)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            messageList
-
-            if let prioritizedSelectionText,
-               !prioritizedSelectionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                prioritizedBadge(text: prioritizedSelectionText)
-            }
-
-            composer
-        }
-        .padding(14)
-        .background(Color(nsColor: .controlBackgroundColor))
+        ChatView(
+            sharedURLs: $sharedURLs,
+            sharedPDFs: $sharedPDFs,
+            sharedImages: $sharedImages,
+            chatService: chatService,
+            mode: .pdfTalkme,
+            onPDFAddedToContext: { url in
+                handlePDFAddedFromChat(url)
+            },
+            onPDFRemovedFromContext: { url in
+                closeTabMatching(url)
+            },
+            pdfRemovalRequests: pdfRemovalSubject.eraseToAnyPublisher()
+        )
     }
 
-    private var chatHeader: some View {
-        VStack(spacing: 12) {
-            HStack {
-                HStack(spacing: 8) {
-                    Image("PDFtalkmeLogo")
-                        .resizable()
-                        .interpolation(.high)
-                        .frame(width: 20, height: 20)
-                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-                    Text("PDFtalkme")
-                        .font(.title3)
-                        .fontWeight(.semibold)
-                }
-
-                Spacer()
-
-                Button {
-                    chatService.clearInMemoryConversation()
-                } label: {
-                    Label("New Chat", systemImage: "arrow.clockwise")
-                }
-                .buttonStyle(.bordered)
-
-                Button {
-                    chatService.clearHistoryForActiveDocument()
-                } label: {
-                    Label("Clear History", systemImage: "trash")
-                }
-                .buttonStyle(.bordered)
-                .disabled(selectedPDFURL == nil)
-            }
-
-            HStack(spacing: 10) {
-                Picker("Language", selection: $settings.language) {
-                    ForEach(ModelLanguage.allCases, id: \.self) { language in
-                        Text(language.rawValue).tag(language)
-                    }
-                }
-                .pickerStyle(.segmented)
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Temp \(String(format: "%.2f", settings.temperature))")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    Slider(value: $settings.temperature, in: AppSettings.temperatureRange, step: 0.05)
-                }
-            }
-        }
+    /// Removes any tab whose base filename matches `url` — used when
+    /// `ChatView` reports that the user clicked × on a PDF context row.
+    private func closeTabMatching(_ url: URL) {
+        let key = ChatService.pdfBaseFilename(url.lastPathComponent)
+        guard let tab = openTabs.first(where: {
+            ChatService.pdfBaseFilename($0.url.lastPathComponent) == key
+        }) else { return }
+        closeTab(tab, alsoRemoveFromChat: false)
     }
 
-    private var messageList: some View {
-        ScrollView {
-            LazyVStack(spacing: 10) {
-                if chatService.messages.isEmpty {
-                    Text("Ask questions about the active PDF tab. Starred selections are forced as rank-1 retrieval context.")
-                        .foregroundColor(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+    // MARK: - Splitter
 
-                ForEach(chatService.messages) { message in
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(message.role == .user ? "You" : "Assistant")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-
-                        renderedMessageContent(message)
-                            .textSelection(.enabled)
-
-                        if let citations = message.citations,
-                           !citations.isEmpty {
-                            Divider()
-                            citationList(citations)
-                        }
-                    }
-                    .padding(10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(
-                        message.role == .user
-                        ? Color.accentColor.opacity(0.15)
-                        : Color(nsColor: .textBackgroundColor)
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                }
-
-                if chatService.isResponding {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("Thinking...")
-                            .foregroundColor(.secondary)
-                        Spacer()
-                    }
-                }
-            }
-        }
-        .padding(8)
-        .background(Color(nsColor: .textBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    /// Resolves the stored fraction to an absolute pane width for a given
+    /// window content width, clamped so neither pane collapses below
+    /// `minPaneWidth`.
+    private func pdfPaneWidth(for total: CGFloat) -> CGFloat {
+        let maxAllowed = max(minPaneWidth, total - minPaneWidth - dividerHitWidth)
+        let raw = CGFloat(pdfPaneFraction) * total
+        return min(max(raw, minPaneWidth), maxAllowed)
     }
 
-    @ViewBuilder
-    private func renderedMessageContent(_ message: PDFChatMessage) -> some View {
-        if message.role == .assistant {
-            LaTeX(ModelOutputLaTeXSanitizer.sanitize(message.content))
-                .font(.body)
-                .foregroundColor(colorScheme == .dark ? .white : .black)
+    /// Sizes the PDF pane to exactly `desired` points and grows/shrinks the
+    /// window by the matching delta so the chat pane keeps its width and the
+    /// window height is preserved. Used by single-page (full-height) layout
+    /// to reveal a whole page. Updates the fraction against the *new* total
+    /// so a later window resize keeps the proportion.
+    private func applyPaneWidth(_ desired: CGFloat) {
+#if os(macOS)
+        guard let window = previewController.pdfView?.window,
+              let content = window.contentView else { return }
+        let total = content.bounds.width
+        let currentPaneWidth = pdfPaneWidth(for: total)
+        let target = max(minPaneWidth, desired)
+        let delta = target - currentPaneWidth
+        guard abs(delta) > 0.5 else { return }
+
+        let newTotal = total + delta
+        pdfPaneFraction = Double(target / newTotal)
+
+        var frame = window.frame
+        // setFrame origin is bottom-left; growing width while keeping
+        // origin.y preserves the top edge and the height.
+        frame.size.width += delta
+        window.setFrame(frame, display: true, animate: true)
+#endif
+    }
+
+    private func splitter(totalWidth: CGFloat) -> some View {
+        Rectangle()
+            .fill(Color.clear)
+            .frame(width: dividerHitWidth)
+            .overlay(
+                Rectangle()
+                    .fill(Color.secondary.opacity(0.25))
+                    .frame(width: 1)
+            )
+#if os(macOS)
+            .onHover { inside in
+                if inside {
+                    NSCursor.resizeLeftRight.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+#endif
+            .gesture(
+                DragGesture()
+                    .onChanged { value in
+                        let start = dragStartPaneWidth ?? pdfPaneWidth(for: totalWidth)
+                        if dragStartPaneWidth == nil { dragStartPaneWidth = start }
+                        let proposed = start + value.translation.width
+                        let maxAllowed = max(minPaneWidth, totalWidth - minPaneWidth - dividerHitWidth)
+                        let clamped = min(max(proposed, minPaneWidth), maxAllowed)
+                        pdfPaneFraction = Double(clamped / max(totalWidth, 1))
+                    }
+                    .onEnded { _ in dragStartPaneWidth = nil }
+            )
+    }
+
+    // MARK: - Tab management
+
+    /// Adds `url` as a new tab (or selects the existing one) and pushes the
+    /// full open-tab list into `ChatView` so every PDF is part of the RAG
+    /// context. Conversation restore happens only when the user explicitly
+    /// picks one from history — not on drop / pick — so we no longer try
+    /// to auto-load a prior chat here.
+    private func addTab(for url: URL, makeActive: Bool) {
+        if let existing = openTabs.first(where: { sameFile($0.url, url) }) {
+            if makeActive { selectedTabID = existing.id }
         } else {
-            Text(message.content)
+            let tab = PDFTab(url: url)
+            openTabs.append(tab)
+            if makeActive { selectedTabID = tab.id }
+        }
+        chatService.modelContext = modelContext
+
+        // Push every open tab as RAG context. `ChatView.mergeShared` will
+        // either attach (if any incoming PDF matches the active conv's
+        // anchor) or reset (if the conv is unrelated / nil).
+        sharedPDFs = openTabs.map(\.url)
+
+        startBackgroundChecksum(for: openTabs.first?.url ?? url)
+    }
+
+    /// Closes a tab. `alsoRemoveFromChat: true` (default) also tells
+    /// `ChatView` to drop the matching PDF context row — that's what the
+    /// user expects when they click × on the tab. `false` is used for the
+    /// inverse direction, when `ChatView` already removed the row and we
+    /// just need to mirror the close.
+    private func closeTab(_ tab: PDFTab, alsoRemoveFromChat: Bool = true) {
+        guard let index = openTabs.firstIndex(of: tab) else { return }
+        openTabs.remove(at: index)
+        if alsoRemoveFromChat {
+            pdfRemovalSubject.send(tab.url)
+        }
+        if openTabs.isEmpty {
+            // Last tab closed — same effect as the trash button.
+            clearWindow()
+        } else if selectedTabID == tab.id {
+            selectedTabID = openTabs.indices.contains(index)
+                ? openTabs[index].id
+                : openTabs.last?.id
         }
     }
 
-    private var findBar: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-                .foregroundColor(.secondary)
-
-            TextField(
-                settings.language == .french ? "Rechercher dans le PDF" : "Search in PDF",
-                text: $findQuery
-            )
-            .textFieldStyle(.roundedBorder)
-            .focused($isFindFieldFocused)
-            .onSubmit {
-                runFind(next: true)
-            }
-
-            Button {
-                runFind(next: false)
-            } label: {
-                Image(systemName: "chevron.up")
-            }
-            .buttonStyle(.bordered)
-            .disabled(findQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-            Button {
-                runFind(next: true)
-            } label: {
-                Image(systemName: "chevron.down")
-            }
-            .buttonStyle(.bordered)
-            .disabled(findQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-            Button {
-                showFindBar = false
-                findQuery = ""
-                findRequest = nil
-                findMatchCount = 0
-                findMatchIndex = 0
-                isFindFieldFocused = false
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-            }
-            .buttonStyle(.plain)
-            .foregroundColor(.secondary)
-
-            Text(findStatusLabel)
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .frame(minWidth: 60, alignment: .trailing)
-        }
-        .padding(8)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    /// Toolbar "Clear" — wipe the window back to a fresh state: no tabs,
+    /// no displayed PDF, brand-new chat conversation.
+    private func clearWindow() {
+        checksumTask?.cancel()
+        openTabs.removeAll()
+        selectedTabID = nil
+        sharedPDFs = []
+        chatService.resetConversation()
     }
 
-    private var documentSidebar: some View {
-        VStack(spacing: 0) {
-            Picker("Sidebar", selection: $sidebarMode) {
-                Text(settings.language == .french ? "Plan" : "Outline").tag(PDFSidebarMode.outline)
-                Text(settings.language == .french ? "Pages" : "Pages").tag(PDFSidebarMode.pages)
-            }
-            .pickerStyle(.segmented)
-            .padding(8)
+    // MARK: - PDF entry points
 
-            Divider()
-
-            if sidebarMode == .outline {
-                outlineList
-            } else {
-                pagePreviewList
-            }
-        }
-        .background(Color(nsColor: .controlBackgroundColor))
+    /// Drop / picker / external open on the *left* side. The PDF isn't yet
+    /// in `ChatView`'s context — `addTab` will push it via `sharedPDFs`.
+    private func loadPDF(_ url: URL) {
+        addTab(for: url, makeActive: true)
     }
 
-    private var outlineList: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 4) {
-                if outlineItems.isEmpty {
-                    Text(settings.language == .french ? "Aucun plan" : "No outline")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    ForEach(outlineItems) { item in
-                        Button {
-                            focusedCitationRequest = PDFCitationFocusRequest(
-                                citation: PDFCitation(
-                                    rank: item.page,
-                                    source: "outline",
-                                    page: item.page,
-                                    snippet: nil,
-                                    isPriority: false
-                                )
-                            )
-                        } label: {
-                            HStack(spacing: 8) {
-                                Text(item.title)
-                                    .lineLimit(1)
-                                Spacer(minLength: 8)
-                                Text("\(item.page)")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
-                            .padding(.leading, CGFloat(item.level) * 10)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-            .padding(8)
-        }
-    }
-
-    private var pagePreviewList: some View {
-        ScrollView {
-            LazyVStack(spacing: 8) {
-                if pagePreviews.isEmpty {
-                    Text(settings.language == .french ? "Aucune page" : "No pages")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    ForEach(pagePreviews) { preview in
-                        Button {
-                            focusedCitationRequest = PDFCitationFocusRequest(
-                                citation: PDFCitation(
-                                    rank: preview.page,
-                                    source: "page-preview",
-                                    page: preview.page,
-                                    snippet: nil,
-                                    isPriority: false
-                                )
-                            )
-                        } label: {
-                            VStack(spacing: 6) {
-                                Image(nsImage: preview.thumbnail)
-                                    .resizable()
-                                    .interpolation(.high)
-                                    .scaledToFit()
-                                    .frame(height: 150)
-                                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-
-                                Text("\(settings.language == .french ? "Page" : "Page") \(preview.page)")
-                                    .font(.caption)
-                                    .foregroundColor(.primary)
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(8)
-                            .background(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .fill(Color(nsColor: .textBackgroundColor))
-                            )
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-            .padding(8)
-        }
-    }
-
-    private var composer: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            TextField("Ask about this PDF", text: $composerInput, axis: .vertical)
-                .lineLimit(1...5)
-                .textFieldStyle(.roundedBorder)
-                .focused($isComposerFocused)
-                .onSubmit {
-                    submit()
-                }
-
-            Button("Send") {
-                submit()
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(
-                composerInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                chatService.isResponding
-            )
-        }
-    }
-
-    private func citationList(_ citations: [PDFCitation]) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(settings.language == .french ? "Pages suggerees" : "Suggested pages")
-                .font(.caption2)
-                .foregroundColor(.secondary)
-
-            ForEach(citations) { citation in
-                Button {
-                    focusedCitationRequest = PDFCitationFocusRequest(citation: citation)
-                } label: {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(citationLabel(citation))
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                            .foregroundColor(.black)
-
-                        if let snippet = citation.snippet,
-                           !snippet.isEmpty {
-                            Text(snippet)
-                                .font(.caption2)
-                                .foregroundColor(.black.opacity(0.82))
-                                .lineLimit(2)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(8)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(Color(red: 0.83, green: 0.76, blue: 0.98))
-                    )
-                }
-                .buttonStyle(.plain)
-            }
-        }
-    }
-
-    private func citationLabel(_ citation: PDFCitation) -> String {
-        let pagePrefix = settings.language == .french ? "page" : "page"
-        let priority = citation.isPriority ? (settings.language == .french ? " • Priorite" : " • Priority") : ""
-        if let page = citation.page {
-            return "#\(citation.rank) \(pagePrefix) \(page)\(priority)"
-        }
-        return "#\(citation.rank)\(priority)"
-    }
-
-    private var selectionPopup: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("Selected passage", systemImage: "star.fill")
-                .font(.subheadline)
-                .fontWeight(.semibold)
-
-            Text(selectionPreview(selectedSelectionText))
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .lineLimit(3)
-
-            Button {
-                prioritizedSelectionText = selectedSelectionText
-            } label: {
-                Label("Ask about this selection", systemImage: "sparkles")
-            }
-            .buttonStyle(.borderedProminent)
-        }
-        .padding(12)
-        .frame(width: 300, alignment: .leading)
-        .background(.regularMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .shadow(radius: 8)
-    }
-
-    private func prioritizedBadge(text: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: "star.circle.fill")
-                .foregroundColor(.yellow)
-
-            Text("Rank-1 context from selection")
-                .font(.caption)
-                .fontWeight(.semibold)
-
-            Text(selectionPreview(text))
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .lineLimit(1)
-
-            Spacer(minLength: 8)
-
-            Button {
-                prioritizedSelectionText = nil
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-            }
-            .buttonStyle(.plain)
-            .foregroundColor(.secondary)
-        }
-        .padding(8)
-        .background(Color.yellow.opacity(0.15))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-
-    private var shouldShowSelectionPopup: Bool {
-        !selectedSelectionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    private var selectionPopupTopPadding: CGFloat {
-        var offset: CGFloat = 66
-        if showFindBar {
-            offset += 46
-        }
-        if !documents.isEmpty {
-            offset += 38
-        }
-        return offset
-    }
-
-    private var findStatusLabel: String {
-        if findMatchCount == 0 {
-            return settings.language == .french ? "0 resultat" : "0 matches"
-        }
-        return "\(findMatchIndex)/\(findMatchCount)"
-    }
-
-    private func selectionPreview(_ text: String) -> String {
-        let compact = text.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if compact.count <= 160 {
-            return compact
-        }
-        let end = compact.index(compact.startIndex, offsetBy: 160)
-        return String(compact[..<end]) + "..."
-    }
-
-    private func submit() {
-        let trimmed = composerInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        composerInput = ""
-
-        Task {
-            await chatService.sendMessage(
-                trimmed,
-                pdfURL: selectedPDFURL,
-                prioritizedSelectionText: prioritizedSelectionText,
-                settings: settings
-            )
-        }
-    }
-
-    private func handlePDFImport(_ result: Result<[URL], Error>) {
-        guard case .success(let urls) = result else { return }
-        addPDFTabs(urls)
-    }
-
-    private func addDroppedPDFs(_ urls: [URL]) {
-        var persisted: [URL] = []
-        for url in urls where url.pathExtension.lowercased() == "pdf" {
-            if let stableURL = copyDroppedPDFToTemporaryStorage(url) {
-                persisted.append(stableURL)
-            }
-        }
-        if !persisted.isEmpty {
-            addPDFTabs(persisted)
-        }
-    }
-
-    private func addPDFTabs(_ urls: [URL], allowSelectingExistingTab: Bool = true) {
-        for url in urls where url.pathExtension.lowercased() == "pdf" {
-            if allowSelectingExistingTab,
-               let existing = documents.first(where: { $0.url.standardizedFileURL == url.standardizedFileURL }) {
-                selectedTabID = existing.id
-                continue
-            }
-            let tab = PDFDocumentTab(url: url)
-            documents.append(tab)
+    /// `ChatView` itself ingested a PDF (drop on the chat pane, or shared
+    /// inbox). The file is already in chat context — just mirror it as a
+    /// tab on the left.
+    private func handlePDFAddedFromChat(_ url: URL) {
+        if !openTabs.contains(where: { sameFile($0.url, url) }) {
+            let tab = PDFTab(url: url)
+            openTabs.append(tab)
             selectedTabID = tab.id
+        } else if selectedTabID == nil {
+            selectedTabID = openTabs.first(where: { sameFile($0.url, url) })?.id
         }
-
-        if selectedTabID == nil, let first = documents.first {
-            selectedTabID = first.id
-        }
-
-        selectedSelectionText = ""
-        prioritizedSelectionText = nil
-        activateSelectedTab()
+        chatService.modelContext = modelContext
+        startBackgroundChecksum(for: openTabs.first?.url ?? url)
     }
 
-    private func copyDroppedPDFToTemporaryStorage(_ sourceURL: URL) -> URL? {
-        let fileManager = FileManager.default
-        let folder = fileManager.temporaryDirectory.appendingPathComponent("PDFtalkmeDroppedPDFs", isDirectory: true)
-
-        do {
-            try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
-            let preferredName = sourceURL.lastPathComponent.isEmpty ? "dropped.pdf" : sourceURL.lastPathComponent
-            let uniqueFolder = folder.appendingPathComponent(UUID().uuidString, isDirectory: true)
-            try fileManager.createDirectory(at: uniqueFolder, withIntermediateDirectories: true)
-            let destination = uniqueFolder.appendingPathComponent(preferredName)
-            if fileManager.fileExists(atPath: destination.path) {
-                try fileManager.removeItem(at: destination)
+    private func startBackgroundChecksum(for url: URL) {
+        checksumTask?.cancel()
+        let filename = url.lastPathComponent
+        // Capture the service as a non-Sendable reference via a local. The
+        // hashing itself runs nonisolated; the stamp hops back to MainActor.
+        let service = chatService
+        checksumTask = Task.detached(priority: .utility) {
+            guard let checksum = PDFFingerprint.sha256(of: url) else { return }
+            await MainActor.run {
+                guard service.currentConversationPDFFilename == filename else { return }
+                service.updateCurrentConversationChecksum(checksum)
             }
-            try fileManager.copyItem(at: sourceURL, to: destination)
-            return destination
-        } catch {
-            #if DEBUG
-            print("[ContentView] Failed to persist dropped PDF: \(error.localizedDescription)")
-            #endif
-            return nil
         }
     }
 
-    private func closeTab(id: UUID) {
-        guard let index = documents.firstIndex(where: { $0.id == id }) else { return }
-        documents.remove(at: index)
+    // MARK: - Open panel / bookmarks
 
-        if selectedTabID == id {
-            selectedTabID = documents.indices.contains(index)
-                ? documents[index].id
-                : documents.last?.id
-            selectedSelectionText = ""
-            prioritizedSelectionText = nil
-            activateSelectedTab()
-        }
-    }
-
-    private func activateSelectedTab() {
-        selectedSelectionText = ""
-        prioritizedSelectionText = nil
-        focusedCitationRequest = nil
-        findRequest = nil
-        findMatchCount = 0
-        findMatchIndex = 0
-        outlineItems = []
-        pagePreviews = []
-        pageCount = 0
-        sidebarRefreshRequestID = UUID()
-        chatService.activateDocument(selectedPDFURL)
-    }
-
-    private func consumePendingOpenRequests() {
-        let requests = openRouter.drain()
-        guard !requests.isEmpty else { return }
-        for request in requests {
-            addPDFTabs(request.urls, allowSelectingExistingTab: !request.openInNewTabs)
-        }
-    }
-
-    private func runFind(next: Bool) {
-        let query = findQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return }
-        selectedSelectionText = ""
-        findRequest = PDFFindRequest(
-            query: query,
-            direction: next ? .next : .previous
-        )
-    }
-
-}
-
-private enum ModelOutputLaTeXSanitizer {
-    static func sanitize(_ input: String) -> String {
-        var sanitized = input
-        sanitized = replacingRegex(
-            in: sanitized,
-            pattern: #"(?<!\s)(\\[A-Za-z]+)"#,
-            with: " $1"
-        )
-        sanitized = replacingDigitPowers(in: sanitized)
-        return sanitized
-    }
-
-    private static func replacingDigitPowers(in text: String) -> String {
-        var output = text
-        output = replacingDigitPowerMatches(in: output, pattern: #"(?<!\\mathrm\{)(\d+)\^\{([^{}]+)\}"#)
-        output = replacingDigitPowerMatches(in: output, pattern: #"(?<!\\mathrm\{)(\d+)\^(-?\d+)"#)
-        return output
-    }
-
-    private static func replacingDigitPowerMatches(in text: String, pattern: String) -> String {
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
-        let nsText = text as NSString
-        let matches = regex.matches(in: text, range: NSRange(location: 0, length: nsText.length))
-        guard !matches.isEmpty else { return text }
-
-        var output = text
-        for match in matches.reversed() {
-            guard match.numberOfRanges >= 3,
-                  let wholeRange = Range(match.range(at: 0), in: output),
-                  let baseRange = Range(match.range(at: 1), in: output),
-                  let exponentRange = Range(match.range(at: 2), in: output) else {
-                continue
+    private func presentOpenPanel() {
+#if os(macOS)
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [.pdf]
+        panel.prompt = "Open"
+        panel.message = "Choose one or more PDFs to open in PDFtalkme."
+        if panel.runModal() == .OK {
+            for url in panel.urls {
+                loadPDF(url)
             }
-
-            let base = String(output[baseRange])
-            let exponent = String(output[exponentRange])
-            output.replaceSubrange(wholeRange, with: "\\mathrm{\(base)}^\\mathrm{\(exponent)}")
         }
-        return output
+#endif
     }
 
-    private static func replacingRegex(in text: String, pattern: String, with template: String) -> String {
-        text.replacingOccurrences(of: pattern, with: template, options: .regularExpression)
+    /// Two URLs point at the "same" PDF for tab-deduplication purposes if
+    /// their base names match (filename minus the `" (N)"` copy suffix
+    /// `DroppedPDFStore` adds). Path comparison would fail on sandbox
+    /// symlinks / security-scope wrappers, and raw `lastPathComponent`
+    /// comparison would fail when SilicIA re-persists a re-dropped file as
+    /// `X (2).pdf`. Base-name matching is what the wider conversation
+    /// linking model already uses (see `ChatService.pdfBaseFilename`).
+    private func sameFile(_ lhs: URL, _ rhs: URL) -> Bool {
+        ChatService.pdfBaseFilename(lhs.lastPathComponent)
+            == ChatService.pdfBaseFilename(rhs.lastPathComponent)
     }
-}
 
-private struct PDFDocumentTab: Identifiable, Equatable {
-    let id: UUID
-    let url: URL
-    let title: String
-
-    init(id: UUID = UUID(), url: URL) {
-        self.id = id
-        self.url = url
-        let rawTitle = url.deletingPathExtension().lastPathComponent
-        self.title = rawTitle.replacingOccurrences(
-            of: #"-?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"#,
-            with: "",
-            options: .regularExpression
+    private func resolveSecurityScopedBookmark(_ bookmark: Data) -> URL? {
+        var isStale = false
+#if os(macOS)
+        let options: URL.BookmarkResolutionOptions = [.withSecurityScope]
+#else
+        let options: URL.BookmarkResolutionOptions = []
+#endif
+        return try? URL(
+            resolvingBookmarkData: bookmark,
+            options: options,
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
         )
     }
+
 }
 
-enum PDFSidebarMode {
-    case outline
-    case pages
-}
+/// Empty-state pane shown before any PDF is loaded.
+private struct PDFEmptyState: View {
+    let onPickPDF: ([URL]) -> Void
+    let onChooseTapped: () -> Void
+    @State private var isTargeted = false
 
-struct PDFOutlineItem: Identifiable {
-    let id = UUID()
-    let title: String
-    let page: Int
-    let level: Int
-}
-
-struct PDFPagePreview: Identifiable {
-    let id = UUID()
-    let page: Int
-    let thumbnail: NSImage
-}
-
-enum PDFFindDirection {
-    case previous
-    case next
-}
-
-struct PDFFindRequest: Equatable {
-    let query: String
-    let direction: PDFFindDirection
-    let requestID: UUID
-
-    init(query: String, direction: PDFFindDirection, requestID: UUID = UUID()) {
-        self.query = query
-        self.direction = direction
-        self.requestID = requestID
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "doc.richtext")
+                .font(.system(size: 64, weight: .light))
+                .foregroundStyle(.secondary)
+            Text("Drop a PDF here to start")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+            Button("Choose PDF…", action: onChooseTapped)
+                .buttonStyle(.borderedProminent)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .background(isTargeted ? Color.accentColor.opacity(0.08) : Color.clear)
+        .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
+            loadPDFURLs(from: providers, completion: onPickPDF)
+            return true
+        }
     }
-}
 
-extension Notification.Name {
-    static let pdfTalkmeOpenFind = Notification.Name("PDFtalkme.OpenFind")
+    private func loadPDFURLs(
+        from providers: [NSItemProvider],
+        completion: @escaping ([URL]) -> Void
+    ) {
+        let group = DispatchGroup()
+        var results: [URL] = []
+        let lock = NSLock()
+        for provider in providers {
+            group.enter()
+            _ = provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { data, _ in
+                defer { group.leave() }
+                guard let data,
+                      let url = URL(dataRepresentation: data, relativeTo: nil),
+                      url.pathExtension.lowercased() == "pdf" else { return }
+                lock.lock()
+                results.append(url)
+                lock.unlock()
+            }
+        }
+        group.notify(queue: .main) {
+            if !results.isEmpty { completion(results) }
+        }
+    }
 }
 
 #Preview {
-    ContentView()
+    ContentView(sharedPDFs: .constant([]))
         .frame(width: 1400, height: 900)
 }

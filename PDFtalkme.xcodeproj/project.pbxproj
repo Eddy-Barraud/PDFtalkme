@@ -14,10 +14,34 @@
 		A00100012F00000100000001 /* PDFtalkme.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PDFtalkme.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		A00100202F00000100000001 /* Exceptions for "Shared/SilicIA/SilicIA" folder in "PDFtalkme" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Assets.xcassets,
+				ContentView.swift,
+				Info.plist,
+				SilicIAApp.swift,
+				SilicIAAppShortcuts.swift,
+				SilicIASpotlightIntent.swift,
+				Views/SearchView.swift,
+			);
+			target = A00100062F00000100000001 /* PDFtalkme */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		A00100022F00000100000001 /* PDFtalkme */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = PDFtalkme;
+			sourceTree = "<group>";
+		};
+		A00100212F00000100000001 /* Shared/SilicIA/SilicIA */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				A00100202F00000100000001 /* Exceptions for "Shared/SilicIA/SilicIA" folder in "PDFtalkme" target */,
+			);
+			path = Shared/SilicIA/SilicIA;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -34,11 +58,20 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		36391AA12FC70F2C001DDEDC /* Recovered References */ = {
+			isa = PBXGroup;
+			children = (
+				A00100212F00000100000001 /* Shared/SilicIA/SilicIA */,
+			);
+			name = "Recovered References";
+			sourceTree = "<group>";
+		};
 		A00100042F00000100000001 = {
 			isa = PBXGroup;
 			children = (
 				A00100022F00000100000001 /* PDFtalkme */,
 				A00100052F00000100000001 /* Products */,
+				36391AA12FC70F2C001DDEDC /* Recovered References */,
 			);
 			sourceTree = "<group>";
 		};
@@ -67,6 +100,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				A00100022F00000100000001 /* PDFtalkme */,
+				A00100212F00000100000001 /* Shared/SilicIA/SilicIA */,
 			);
 			name = PDFtalkme;
 			packageProductDependencies = (

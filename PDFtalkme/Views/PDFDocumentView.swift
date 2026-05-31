@@ -14,6 +14,8 @@ struct PDFDocumentView: NSViewRepresentable {
     let focusedCitationRequest: PDFCitationFocusRequest?
     let sidebarRefreshRequestID: UUID
     let findRequest: PDFFindRequest?
+    /// Optional controller driving the floating page / search controls.
+    var previewController: PDFPreviewController?
     let onSelectionChanged: (String) -> Void
     let onDropPDFURLs: ([URL]) -> Void
     let onSidebarDataUpdated: ([PDFOutlineItem], [PDFPagePreview], Int) -> Void
@@ -41,6 +43,9 @@ struct PDFDocumentView: NSViewRepresentable {
             context.coordinator.handleDropped(urls: urls)
         }
         context.coordinator.startObserving(pdfView: view)
+        if let previewController {
+            MainActor.assumeIsolated { previewController.attach(view) }
+        }
         return container
     }
 
@@ -78,6 +83,14 @@ struct PDFDocumentView: NSViewRepresentable {
             context.coordinator.publishFindStatus(count: 0, current: nil)
             if let loadedDocument {
                 context.coordinator.refreshSidebarData(from: loadedDocument)
+            }
+            if let previewController {
+                MainActor.assumeIsolated {
+                    previewController.attach(pdfView)
+                    previewController.documentDidChange()
+                    // Re-apply the active layout to the newly loaded doc.
+                    previewController.setLayout(previewController.layout)
+                }
             }
         }
 

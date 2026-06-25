@@ -12,12 +12,6 @@ import AppKit
 @main
 struct PDFtalkmeApp: App {
     init() {
-        _ = LocalizationService.shared
-        if case .unavailable(let reason) = FoundationModelAvailability.check() {
-            _modelUnavailableMessage = State(initialValue: reason)
-        } else {
-            _modelUnavailableMessage = State(initialValue: nil)
-        }
     }
 
     @State private var sharedPDFs: [URL] = []
@@ -29,23 +23,20 @@ struct PDFtalkmeApp: App {
 
     var body: some Scene {
         WindowGroup(id: "main") {
-            if let message = modelUnavailableMessage {
-                ModelUnavailableView(message: message)
-            } else {
-                ContentView(sharedPDFs: $sharedPDFs)
-                    .onOpenURL(perform: handleIncomingURL)
+
+            ContentView(sharedPDFs: $sharedPDFs)
+                .onOpenURL(perform: handleIncomingURL)
 #if os(macOS)
-                    .onAppear {
-                        appDelegate.onOpenURLs = { urls in
-                            handleIncomingURLs(urls)
-                        }
-                        let pending = appDelegate.drainPendingURLs()
-                        if !pending.isEmpty {
-                            handleIncomingURLs(pending)
-                        }
+                .onAppear {
+                    appDelegate.onOpenURLs = { urls in
+                        handleIncomingURLs(urls)
                     }
+                    let pending = appDelegate.drainPendingURLs()
+                    if !pending.isEmpty {
+                        handleIncomingURLs(pending)
+                    }
+                }
 #endif
-            }
         }
         .defaultSize(width: 1460, height: 940)
         .modelContainer(for: [Conversation.self, Message.self])

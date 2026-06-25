@@ -133,6 +133,23 @@ struct ContentView: View {
                 addedAny = true
             }
         }
+        // When a new chat is started (conversation reset), re-register all
+        // currently open PDF tabs as context sources. This handles the case
+        // where the user clicks "New Chat" while PDFs are open in tabs —
+        // the new conversation should automatically include those PDFs.
+        // Watch for when the conversation is reset (filename becomes nil)
+        // and there are still open tabs — re-push the PDFs so they're
+        // available as context for the new chat.
+        .onReceive(chatService.$currentConversationPDFFilename.removeDuplicates()) { filename in
+            if filename == nil && !openTabs.isEmpty {
+                // Small delay to avoid race condition with startOver() clearing sharedPDFs
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    if !openTabs.isEmpty && chatService.currentConversationPDFFilename == nil {
+                        sharedPDFs = openTabs.map(\.url)
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - Panes

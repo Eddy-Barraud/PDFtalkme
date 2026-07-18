@@ -95,7 +95,14 @@ struct ContentView: View {
             }
         }
         .onChange(of: sharedPDFs) { _, newValue in
+            debugSync("sharedPDFs changed count=\(newValue.count) values=\(newValue.map(\.lastPathComponent))")
+            var seenKeys = Set<String>()
             for url in newValue where url.pathExtension.lowercased() == "pdf" {
+                let key = ChatService.pdfBaseFilename(url.lastPathComponent)
+                if !seenKeys.insert(key).inserted {
+                    debugSync("sharedPDFs suppressed duplicate key=\(key) url=\(url.path)")
+                    continue
+                }
                 addTab(for: url, makeActive: true)
             }
         }
@@ -113,6 +120,7 @@ struct ContentView: View {
         // tabs here — the user may have an unrelated PDF open they want
         // to keep — and we never yank the current selection.
         .onReceive(chatService.$currentConversationPDFFilenames.removeDuplicates()) { filenames in
+            debugSync("conversationPDFFilenames received=\(filenames)")
             guard !filenames.isEmpty else { return }
             let bookmarks = chatService.currentConversationPDFBookmarks
             var addedAny = false
@@ -121,6 +129,7 @@ struct ContentView: View {
                 if openTabs.contains(where: {
                     ChatService.pdfBaseFilename($0.url.lastPathComponent) == key
                 }) {
+                    debugSync("conversation restore skipped existing key=\(key)")
                     continue
                 }
                 guard index < bookmarks.count,
@@ -129,6 +138,7 @@ struct ContentView: View {
                 // window currently has no selection — otherwise leave the
                 // user's selection where it is.
                 let shouldActivate = !addedAny && selectedTabID == nil
+                debugSync("conversation restore adding key=\(key) shouldActivate=\(shouldActivate)")
                 addTab(for: url, makeActive: shouldActivate)
                 addedAny = true
             }
@@ -357,10 +367,12 @@ struct ContentView: View {
     /// to auto-load a prior chat here.
     private func addTab(for url: URL, makeActive: Bool) {
         if let existing = openTabs.first(where: { sameFile($0.url, url) }) {
+            debugSync("addTab reused existing tab title=\(existing.title) key=\(ChatService.pdfBaseFilename(url.lastPathComponent)) makeActive=\(makeActive)")
             if makeActive { selectedTabID = existing.id }
         } else {
             let tab = PDFTab(url: url)
             openTabs.append(tab)
+            debugSync("addTab created tab title=\(tab.title) key=\(ChatService.pdfBaseFilename(url.lastPathComponent)) makeActive=\(makeActive)")
             if makeActive { selectedTabID = tab.id }
         }
         chatService.modelContext = modelContext
@@ -369,6 +381,7 @@ struct ContentView: View {
         // either attach (if any incoming PDF matches the active conv's
         // anchor) or reset (if the conv is unrelated / nil).
         sharedPDFs = openTabs.map(\.url)
+        debugSync("addTab published sharedPDFs count=\(sharedPDFs.count) values=\(sharedPDFs.map(\.lastPathComponent))")
 
         startBackgroundChecksum(for: openTabs.first?.url ?? url)
     }
@@ -420,8 +433,12 @@ struct ContentView: View {
             let tab = PDFTab(url: url)
             openTabs.append(tab)
             selectedTabID = tab.id
+            debugSync("handlePDFAddedFromChat appended tab title=\(tab.title) key=\(ChatService.pdfBaseFilename(url.lastPathComponent))")
         } else if selectedTabID == nil {
             selectedTabID = openTabs.first(where: { sameFile($0.url, url) })?.id
+            debugSync("handlePDFAddedFromChat selected existing tab key=\(ChatService.pdfBaseFilename(url.lastPathComponent))")
+        } else {
+            debugSync("handlePDFAddedFromChat ignored duplicate key=\(ChatService.pdfBaseFilename(url.lastPathComponent))")
         }
         chatService.modelContext = modelContext
         startBackgroundChecksum(for: openTabs.first?.url ?? url)
@@ -471,6 +488,12 @@ struct ContentView: View {
     private func sameFile(_ lhs: URL, _ rhs: URL) -> Bool {
         ChatService.pdfBaseFilename(lhs.lastPathComponent)
             == ChatService.pdfBaseFilename(rhs.lastPathComponent)
+    }
+
+    private func debugSync(_ message: @autoclosure () -> String) {
+        #if DEBUG
+        print("[ContentView][PDFSync] \(message())")
+        #endif
     }
 
     private func resolveSecurityScopedBookmark(_ bookmark: Data) -> URL? {

@@ -10,15 +10,6 @@ import PDFKit
 import AppKit
 #endif
 
-/// Page-layout mode for the preview pane.
-enum PDFPageLayout {
-    /// Vertically scrolling, all pages stacked (the default reading view).
-    case continuousScroll
-    /// One page at a time, sized to fit the pane height. Switching to this
-    /// mode asks the host to widen the window so a full page is visible.
-    case singlePageHeight
-}
-
 /// Bridges the SwiftUI floating controls to the live `PDFView` owned by
 /// `PDFDocumentView`. The representable registers its `PDFView` here on
 /// `makeNSView`; the controls read `@Published` state and call the action
@@ -39,9 +30,6 @@ final class PDFPreviewController {
     /// type freely (including transient invalid values) without yanking the
     /// document until they commit.
     var pageFieldText: String = "1"
-
-    // Layout
-    var layout: PDFPageLayout = .continuousScroll
 
     // Search
     var searchQuery: String = ""
@@ -135,10 +123,6 @@ final class PDFPreviewController {
 
     // MARK: - Layout
 
-    func toggleLayout() {
-        setLayout(layout == .continuousScroll ? .singlePageHeight : .continuousScroll)
-    }
-
     /// Resizes the window so one full page fits at the current pane height,
     /// *without* changing the scroll/display mode. Useful in continuous
     /// scroll to size the column to a whole page width on demand.
@@ -146,22 +130,10 @@ final class PDFPreviewController {
         fitPaneToCurrentPage()
     }
 
-    func setLayout(_ newLayout: PDFPageLayout) {
-        layout = newLayout
+    func enforceContinuousLayout() {
         guard let pdfView else { return }
-
-        switch newLayout {
-        case .continuousScroll:
-            pdfView.displayMode = .singlePageContinuous
-            pdfView.autoScales = true
-        case .singlePageHeight:
-            pdfView.displayMode = .singlePage
-            // Let PDFKit fit the *entire* page inside the view — this never
-            // crops. We then size the pane to the page's aspect ratio so the
-            // fit is bound by height (full-height page) with no side gaps.
-            pdfView.autoScales = true
-            fitPaneToCurrentPage()
-        }
+        pdfView.displayMode = .singlePageContinuous
+        pdfView.autoScales = true
     }
 
     /// Asks the host to size the PDF pane to the current page's aspect ratio

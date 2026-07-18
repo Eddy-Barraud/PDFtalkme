@@ -311,25 +311,37 @@ struct ContentView: View {
               let content = window.contentView else { return }
         let total = content.bounds.width
         let currentPaneWidth = pdfPaneWidth(for: total)
-        let target = max(minPaneWidth, desired)
-        let delta = target - currentPaneWidth
+        // Preserve the current chat-pane width exactly while resizing the
+        // PDF pane to the requested width.
+        let currentChatWidth = max(0, total - currentPaneWidth - dividerHitWidth)
+        let targetPaneWidth = max(minPaneWidth, desired)
+        let requestedTotalWidth = targetPaneWidth + dividerHitWidth + currentChatWidth
+        let delta = requestedTotalWidth - total
         guard abs(delta) > 0.5 else { return }
-
-        let newTotal = total + delta
-        pdfPaneFraction = Double(target / newTotal)
 
         var frame = window.frame
         // setFrame origin is bottom-left; growing width while keeping
         // origin.y preserves the top edge and the height.
         frame.size.width += delta
-        window.setFrame(frame, display: true, animate: true)
+        window.setFrame(frame, display: true, animate: false)
+
+        // Recompute from the actual post-resize content width (the OS may
+        // clamp/adjust requested frame sizes), then clamp so splitter drag
+        // keeps working and neither pane collapses below minimum width.
+        let actualTotal = window.contentView?.bounds.width ?? requestedTotalWidth
+        let maxAllowedPane = max(minPaneWidth, actualTotal - minPaneWidth - dividerHitWidth)
+        let clampedPane = min(max(targetPaneWidth, minPaneWidth), maxAllowedPane)
+        pdfPaneFraction = Double(clampedPane / max(actualTotal, 1))
 #endif
     }
 
     private func splitter(totalWidth: CGFloat) -> some View {
         Rectangle()
-            .fill(Color.clear)
+            // Transparent views can be flaky hit targets on macOS; keep a
+            // near-invisible fill so drag gestures always register.
+            .fill(Color.primary.opacity(0.001))
             .frame(width: dividerHitWidth)
+            .contentShape(Rectangle())
             .overlay(
                 Rectangle()
                     .fill(Color.secondary.opacity(0.25))

@@ -88,8 +88,7 @@ struct PDFDocumentView: NSViewRepresentable {
                 MainActor.assumeIsolated {
                     previewController.attach(pdfView)
                     previewController.documentDidChange()
-                    // Re-apply the active layout to the newly loaded doc.
-                    previewController.setLayout(previewController.layout)
+                    previewController.enforceContinuousLayout()
                 }
             }
         }

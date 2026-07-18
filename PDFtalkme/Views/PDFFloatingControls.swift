@@ -6,8 +6,7 @@
 import SwiftUI
 
 /// Liquid-glass floating controls overlaid on the bottom of the preview
-/// pane: page navigation + jump field, a layout toggle, and a search bar
-/// with match iteration.
+/// pane: page navigation + jump field and fit-to-page-height.
 struct PDFFloatingControls: View {
     @Bindable var controller: PDFPreviewController
     @FocusState private var pageFieldFocused: Bool
@@ -15,7 +14,6 @@ struct PDFFloatingControls: View {
     var body: some View {
         HStack(spacing: 10) {
             navigationCluster
-            layoutToggle
             fitWidthButton
         }
         .padding(.horizontal, 14)
@@ -53,24 +51,6 @@ struct PDFFloatingControls: View {
             .font(.callout)
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 7)
-        .glassEffect(.regular, in: .capsule)
-    }
-
-    // MARK: - Layout toggle
-
-    private var layoutToggle: some View {
-        controlButton(
-            systemImage: controller.layout == .continuousScroll
-                ? "doc.plaintext"
-                : "scroll",
-            help: controller.layout == .continuousScroll
-                ? "Switch to single full-height page"
-                : "Switch to continuous scrolling"
-        ) {
-            controller.toggleLayout()
-        }
-        .padding(.horizontal, 10)
         .padding(.vertical, 7)
         .glassEffect(.regular, in: .capsule)
     }

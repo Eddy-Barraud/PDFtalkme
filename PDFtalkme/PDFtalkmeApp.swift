@@ -23,7 +23,6 @@ struct PDFtalkmeApp: App {
 
     var body: some Scene {
         WindowGroup(id: "main") {
-
             ContentView(sharedPDFs: $sharedPDFs)
                 .onOpenURL(perform: handleIncomingURL)
 #if os(macOS)
@@ -37,7 +36,6 @@ struct PDFtalkmeApp: App {
                     }
                 }
 #endif
-            }
         }
         .defaultSize(width: 1460, height: 940)
         .modelContainer(for: [Conversation.self, Message.self])
